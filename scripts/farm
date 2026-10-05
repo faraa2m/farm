@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# farm — dispatch bounded work to other local coding agents (Claude Code, Codex, Grok).
+#
+#   farm detect                      which harness is running this shell
+#   farm workers                     installed harnesses, minus the current one
+#   farm run <worker> [opts] PROMPT  run one headless job, write results to disk
+#   farm par <jobs.tsv>              run several jobs in parallel, summarize
+#   farm help
+set -euo pipefail
+
+WORKERS=(claude codex grok)
+# Env markers each harness sets in the shells it spawns. The first non-empty one wins,
+# after FARM_WORKER, which the dispatcher sets explicitly so nested runs never misdetect.
+CLAUDE_MARKERS=(CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT CLAUDE_PID)
+CODEX_MARKERS=(CODEX_THREAD_ID CODEX_SESSION_ID CODEX_SANDBOX CODEX_VERSION CODEX_CI)
+GROK_MARKERS=(GROK_SESSION_ID GROK_AGENT)
+
+die() { printf 'farm: %s\n' "$*" >&2; exit 2; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  farm detect
+  farm workers
+  farm run <claude|codex|grok> [-C DIR] [--write|--read-only] [-t SECS] [-o OUT] [-m MODEL]
+           [--max-turns N] (PROMPT | -f FILE | -)
+  farm par <jobs.tsv> [-t SECS]
+  farm help
+
+run options:
+  -C DIR          working directory for the worker (default: current directory)
+  --read-only     worker may read and run commands but not edit files (default)
+  --write         worker may edit files under DIR
+  -t SECS         kill the worker after SECS seconds (default: 900)
+  -o OUT          output path prefix (default: .farm/runs/<timestamp>/<worker>-<n>)
+  -m MODEL        model override passed through to the worker CLI
+  --max-turns N   cap agent turns where the CLI supports it (claude, grok)
+  -f FILE         read the prompt from FILE;  "-" reads it from stdin
+
+outputs (per job):
+  OUT.result.md   the worker's final answer, plain text
+  OUT.raw.json    the CLI's JSON envelope when it has one (claude, grok)
+  OUT.stderr.log  the worker's stderr
+  OUT.meta        worker, mode, dir, exit code, duration, cost when reported, exact command
+
+jobs.tsv for `par`: one job per line, tab-separated:
+  worker <TAB> read-only|write <TAB> dir <TAB> prompt-file
+Blank lines and lines starting with # are ignored.
+EOF
+}
+
+any_set() { local v; for v in "$@"; do [[ -n "${!v:-}" ]] && return 0; done; return 1; }
+
+detect() {
+  if [[ -n "${FARM_WORKER:-}" ]]; then printf '%s\n' "$FARM_WORKER"; return; fi
+  # A worker spawned by one harness inherits the parent's markers, so check the
+  # harnesses that are only ever workers-in-a-sandbox first.
+  if any_set "${CODEX_MARKERS[@]}"; then echo codex; return; fi
+  if any_set "${GROK_MARKERS[@]}"; then echo grok; return; fi
+  if any_set "${CLAUDE_MARKERS[@]}"; then echo claude; return; fi
+  # Fall back to walking parent processes; sandboxes may forbid ps, so tolerate failure.
+  local pid=$$ name i
+  for i in 1 2 3 4 5 6 7 8; do
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+    [[ -z "$pid" || "$pid" == 0 || "$pid" == 1 ]] && break
+    name=$(basename "$(ps -o comm= -p "$pid" 2>/dev/null || true)")
+    case "$name" in
+      claude*) echo claude; return ;;
+      codex*)  echo codex;  return ;;
+      grok*)   echo grok;   return ;;
+    esac
+  done
+  echo unknown
+}
+
+workers() {
+  local self w
+  self=$(detect)
+  for w in "${WORKERS[@]}"; do
+    [[ "$w" == "$self" ]] && continue
+    command -v "$w" >/dev/null 2>&1 && printf '%s\n' "$w"
+  done
+}
+
+# Strip every harness marker so the worker's own detection sees only itself.
+# Fills the caller's ENV_PREFIX array (bash 3.2 has no mapfile).
+ENV_PREFIX=()
+build_scrubbed_env() {
+  local v
+  ENV_PREFIX=(env -u FARM_WORKER)
+  for v in "${CLAUDE_MARKERS[@]}" "${CODEX_MARKERS[@]}" "${GROK_MARKERS[@]}" \
+           CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN \
+           CLAUDE_CODE_SESSION_ATTENDED CLAUDE_CODE_EXECPATH CLAUDE_EFFORT \
+           CODEX_SANDBOX_NETWORK_DISABLED; do
+    ENV_PREFIX+=(-u "$v")
+  done
+}
+
+default_out() {
+  local worker=$1 dir=$2 run n
+  run="$dir/.farm/runs/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$run"
+  n=1
+  while [[ -e "$run/$worker-$n.meta" ]]; do n=$((n + 1)); done
+  printf '%s\n' "$run/$worker-$n"
+}
+
+# Keep .farm/ out of the host repo without touching its tracked .gitignore.
+exclude_farm_dir() {
+  local dir=$1 top
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  local excl="$top/.git/info/exclude"
+  [[ -f "$excl" ]] && grep -qx '.farm/' "$excl" && return 0
+  mkdir -p "$(dirname "$excl")" && printf '.farm/\n' >>"$excl"
+}
+
+run() {
+  local worker=${1:-}; shift || true
+  [[ " ${WORKERS[*]} " == *" $worker "* ]] || die "unknown worker '$worker' (expected: ${WORKERS[*]})"
+  command -v "$worker" >/dev/null 2>&1 || die "'$worker' is not installed or not on PATH"
+  [[ "$worker" == "$(detect)" ]] && die "refusing to farm to '$worker' — that is the current harness; use its native subagents"
+
+  local dir=$PWD mode=read-only secs=900 out="" model="" max_turns="" prompt_file="" prompt=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -C) dir=$2; shift 2 ;;
+      --write) mode=write; shift ;;
+      --read-only) mode=read-only; shift ;;
+      -t) secs=$2; shift 2 ;;
+      -o) out=$2; shift 2 ;;
+      -m) model=$2; shift 2 ;;
+      --max-turns) max_turns=$2; shift 2 ;;
+      -f) prompt_file=$2; shift 2 ;;
+      -) prompt_file=/dev/stdin; shift ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "unknown option '$1'" ;;
+      *) prompt=$1; shift ;;
+    esac
+  done
+  [[ -d "$dir" ]] || die "no such directory: $dir"
+  dir=$(cd "$dir" && pwd)
+  if [[ -n "$prompt_file" ]]; then prompt=$(cat "$prompt_file"); fi
+  [[ -n "$prompt" ]] || die "empty prompt"
+  [[ -n "$out" ]] || out=$(default_out "$worker" "$dir")
+  mkdir -p "$(dirname "$out")"
+  exclude_farm_dir "$dir"
+
+  local result="$out.result.md" raw="$out.raw.json" errlog="$out.stderr.log" meta="$out.meta"
+  local -a cmd
+  build_scrubbed_env
+
+  case "$worker" in
+    claude)
+      local perm=plan; [[ "$mode" == write ]] && perm=acceptEdits
+      cmd=(claude -p --output-format json --no-session-persistence --permission-mode "$perm")
+      [[ -n "$model" ]] && cmd+=(--model "$model")
+      [[ -n "$max_turns" ]] && cmd+=(--max-turns "$max_turns")
+      cmd+=(--)
+      ;;
+    codex)
+      local sandbox=read-only; [[ "$mode" == write ]] && sandbox=workspace-write
+      cmd=(codex exec --skip-git-repo-check --ephemeral -C "$dir" -s "$sandbox" -o "$result")
+      [[ -n "$model" ]] && cmd+=(-m "$model")
+      cmd+=(-)
+      ;;
+    grok)
+      local perm=plan; [[ "$mode" == write ]] && perm=acceptEdits
+      cmd=(grok --output-format json --permission-mode "$perm" --cwd "$dir" --no-subagents)
+      [[ -n "$model" ]] && cmd+=(--model "$model")
+      [[ -n "$max_turns" ]] && cmd+=(--max-turns "$max_turns")
+      cmd+=(--prompt-file /dev/stdin)
+      ;;
+  esac
+
+  local started ended status=0
+  started=$(date +%s)
+  if [[ "$worker" == claude ]]; then
+    # claude takes the prompt as an argument; the others read it from stdin.
+    ( cd "$dir" && "${ENV_PREFIX[@]}" FARM_WORKER="$worker" timeout --kill-after=10 "$secs" "${cmd[@]}" "$prompt" ) \
+      >"$raw" 2>"$errlog" || status=$?
+  else
+    ( cd "$dir" && printf '%s' "$prompt" | "${ENV_PREFIX[@]}" FARM_WORKER="$worker" timeout --kill-after=10 "$secs" "${cmd[@]}" ) \
+      >"$raw" 2>"$errlog" || status=$?
+  fi
+  ended=$(date +%s)
+
+  local cost=""
+  case "$worker" in
+    claude)
+      if jq -e . "$raw" >/dev/null 2>&1; then
+        jq -r '.result // empty' "$raw" >"$result"
+        cost=$(jq -r '.total_cost_usd // empty' "$raw")
+      else
+        cp "$raw" "$result"
+      fi
+      ;;
+    grok)
+      if jq -e . "$raw" >/dev/null 2>&1; then
+        jq -r '.text // empty' "$raw" >"$result"
+        cost=$(jq -r '.total_cost_usd // empty' "$raw")
+      else
+        cp "$raw" "$result"
+      fi
+      ;;
+    codex)
+      # codex writes the final message to -o itself; stdout is the streamed transcript.
+      [[ -s "$result" ]] || cp "$raw" "$result"
+      rm -f "$raw"
+      ;;
+  esac
+  [[ $status -eq 124 ]] && printf '\n[farm] killed after %ss timeout\n' "$secs" >>"$result"
+
+  {
+    printf 'worker=%s\nmode=%s\ndir=%s\nexit=%s\nduration_s=%s\n' "$worker" "$mode" "$dir" "$status" "$((ended - started))"
+    [[ -n "$cost" ]] && printf 'cost_usd=%s\n' "$cost"
+    printf 'result=%s\n' "$result"
+    printf 'cmd='; printf '%q ' "${cmd[@]}"; printf '\n'
+  } >"$meta"
+
+  printf '%s exit=%s %ss -> %s\n' "$worker" "$status" "$((ended - started))" "$result"
+  head -n 12 "$result" | sed 's/^/  | /'
+  return "$status"
+}
+
+par() {
+  local jobs=${1:-}; shift || true
+  [[ -f "$jobs" ]] || die "jobs file not found: $jobs"
+  local secs=900
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -t) secs=$2; shift 2 ;; *) die "unknown option '$1'" ;; esac
+  done
+  local -a pids=() labels=() outs=()
+  local worker mode dir file out
+  while IFS=$'\t' read -r worker mode dir file; do
+    [[ -z "$worker" || "$worker" == \#* ]] && continue
+    [[ -f "$file" ]] || die "prompt file not found: $file"
+    out=$(default_out "$worker" "${dir:-$PWD}")
+    local modeflag=--read-only; [[ "$mode" == write ]] && modeflag=--write
+    run "$worker" -C "${dir:-$PWD}" "$modeflag" -t "$secs" -o "$out" -f "$file" >"$out.console" 2>&1 &
+    pids+=($!); labels+=("$worker:$(basename "$file")"); outs+=("$out")
+  done <"$jobs"
+  [[ ${#pids[@]} -gt 0 ]] || die "no jobs in $jobs"
+
+  local i status=0 rc
+  for i in "${!pids[@]}"; do
+    rc=0; wait "${pids[$i]}" || rc=$?
+    [[ $rc -ne 0 ]] && status=1
+    printf '%-28s exit=%-3s %s\n' "${labels[$i]}" "$rc" "${outs[$i]}.result.md"
+  done
+  return "$status"
+}
+
+case "${1:-help}" in
+  detect) detect ;;
+  workers) workers ;;
+  run) shift; run "$@" ;;
+  par) shift; par "$@" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command '$1' (try: farm help)" ;;
+esac
